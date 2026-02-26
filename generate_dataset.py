@@ -5,21 +5,27 @@ Generate paired training data for speech enhancement fine-tuning.
 
 Pipeline per sample:
   1. Load a clean 16 kHz mono WAV file.
-  2. Randomly select a babble noise segment and mix at a random SNR (0–20 dB).
-  3. Resample the noisy mixture from 16 kHz → 8 kHz.
-  4. Apply a 3.4 kHz low-pass filter (telephone bandwidth).
-  5. Encode/decode through G.729D via FFmpeg subprocess.
-  6. Save:
+  2. (Optional, 60% chance) Convolve with a MUSAN RIR for realistic reverberation.
+  3. Randomly select a babble noise segment and mix at a random SNR (0–20 dB).
+  4. Resample the noisy mixture from 16 kHz → 8 kHz.
+  5. Apply a 3.1 kHz low-pass filter (hearing-aid bandwidth).
+  6. Encode/decode through G.729D via FFmpeg subprocess.
+  7. Apply a 150 Hz high-pass filter.
+  8. Normalise RMS to ~0.025.
+  9. Save:
        - degraded 8 kHz signal  → data/degraded/<id>.wav
        - original clean 16 kHz  → data/clean/<id>.wav
-  7. Log (id, snr_db, noise_file) to data/log.csv.
+ 10. Log (id, snr_db, noise_file, rir_file, reverb_applied, blend_ratio) to data/log.csv.
 
 Usage:
   python generate_dataset.py \
       --clean_dir  path/to/clean_speech \
       --noise_dir  path/to/musan_babble \
+      --rir_dir    path/to/musan/noise/reverb \
       --output_dir data \
       --snr_min 0 --snr_max 20 \
+      --reverb_prob 0.6 \
+      --blend_ratio 0.4 \
       --workers 4 \
       --seed 42
 """
@@ -36,7 +42,7 @@ from pathlib import Path
 
 import numpy as np
 import soundfile as sf
-from scipy.signal import butter, sosfilt, resample_poly
+from scipy.signal import butter, sosfilt, resample_poly, fftconvolve
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -190,6 +196,80 @@ def apply_lowpass(audio: np.ndarray, cutoff_hz: float = 3400.0, fs: float = 8000
     return filtered
 
 
+def apply_reverb(clean, rir_files, rng, blend_ratio=0.4):
+    rir_path = rng.choice(rir_files)
+    rir, sr = sf.read(rir_path, dtype="float32", always_2d=False)
+
+    if rir.ndim > 1:
+        rir = rir.mean(axis=1)
+
+    if sr != 16000:
+        rir = resample_poly(rir, up=16000, down=sr).astype(np.float32)
+
+    # Energy normalization (better than peak normalization)
+    rir = rir / (np.sqrt(np.sum(rir ** 2)) + 1e-8)
+
+    reverbed = fftconvolve(clean, rir, mode="full")[:len(clean)]
+
+    blended = (1 - blend_ratio) * clean + blend_ratio * reverbed
+
+    peak = np.max(np.abs(blended))
+    if peak > 0.99:
+        blended = blended * (0.99 / peak)
+
+    return blended.astype(np.float32), rir_path
+
+
+def apply_highpass(
+    audio: np.ndarray,
+    cutoff_hz: float = 120.0,
+    fs: float = 8000.0,
+    order: int = 2,
+) -> np.ndarray:
+    """Apply a Butterworth high-pass filter to remove very low-frequency rumble.
+
+    Parameters
+    ----------
+    audio:
+        Input audio array.
+    cutoff_hz:
+        High-pass cutoff frequency in Hz. Defaults to 150 Hz.
+    fs:
+        Sampling rate of *audio*. Defaults to 8000 Hz.
+    order:
+        Filter order. Defaults to 4.
+
+    Returns
+    -------
+    filtered : np.ndarray
+        Filtered audio array (float32).
+    """
+    nyq = fs / 2.0
+    sos = butter(order, cutoff_hz / nyq, btype="high", output="sos")
+    return sosfilt(sos, audio).astype(np.float32)
+
+
+def normalize_rms(audio: np.ndarray,
+                  rng,
+                  mean: float = 0.025,
+                  std: float = 0.004,
+                  min_rms: float = 0.018,
+                  max_rms: float = 0.035) -> np.ndarray:
+    """
+    Scale audio so RMS follows a clipped Gaussian distribution
+    matching HA recordings.
+    """
+
+    eps = 1e-10
+    current_rms = np.sqrt(np.mean(audio ** 2) + eps)
+
+    target_rms = rng.normalvariate(mean, std)
+    target_rms = max(min_rms, min(max_rms, target_rms))
+
+    return (audio * (target_rms / current_rms)).astype(np.float32)
+
+
+
 def g729_process(audio_8k: np.ndarray, fs: int = 8000) -> np.ndarray:
     """Encode and decode *audio_8k* through the G.729 codec via FFmpeg.
 
@@ -310,44 +390,75 @@ def _process_one(args: tuple) -> dict | None:
     Parameters
     ----------
     args : tuple
-        ``(clean_path, noise_files, output_dir, snr_min, snr_max, seed_offset)``
+        ``(clean_path, noise_files, rir_files, output_dir, snr_min, snr_max,
+           reverb_prob, blend_ratio, seed_offset)``
 
     Returns
     -------
     dict or None
-        Log entry ``{id, snr_db, noise_file}`` on success, ``None`` on failure.
+        Log entry ``{id, snr_db, noise_file, rir_file, reverb_applied,
+        blend_ratio}`` on success, ``None`` on failure.
     """
-    clean_path, noise_files, output_dir, snr_min, snr_max, seed_offset = args
+    (
+        clean_path, noise_files, rir_files, output_dir,
+        snr_min, snr_max, reverb_prob, blend_ratio, seed_offset,
+    ) = args
 
     file_id = Path(clean_path).stem
     # Per-sample deterministic RNG derived from the global seed
     rng = random.Random(seed_offset)
 
+    rir_file_used: str = ""
+    reverb_applied: bool = False
+
     try:
         # 1. Load clean speech
         clean_16k = _load_mono_16k(clean_path)
 
-        # 2. Add babble noise at random SNR
+        # 2. Optional MUSAN RIR reverberation (applied before noise mixing)
+        if rir_files and rng.random() < reverb_prob:
+            blend = rng.uniform(0.25, 0.30)
+            clean_reverbed, rir_file_used = apply_reverb(clean_16k, rir_files, rng, blend)
+            if rir_file_used:
+                clean_16k = clean_reverbed
+                reverb_applied = True
+
+            logger.info("Reverb applied to %s | RIR=%s | blend=%.2f",
+                        file_id, os.path.basename(rir_file_used), blend_ratio)
+
+        # 3. Add babble noise at random SNR
         noise, noise_path = add_babble(clean_16k, noise_files, rng)
         snr_db = rng.uniform(snr_min, snr_max)
         noisy_16k = mix_with_snr(clean_16k, noise, snr_db)
 
-        # 3. Resample 16 k → 8 k
+        # 4. Resample 16 k → 8 k
         noisy_8k = resample_to_8k(noisy_16k)
 
-        # 4. Mild low-pass filter at 3.1 kHz (HA-style bandwidth)
-        noisy_8k_lp = apply_lowpass(noisy_8k,cutoff_hz=3100.0, fs=8000.0,order=2)
+        # 5. Low-pass filter at 3.1 kHz (HA-style bandwidth)
+        noisy_8k_lp = apply_lowpass(noisy_8k, cutoff_hz=3100.0, fs=8000.0, order=2)
 
-        # need to reverbation
-
-        # 5. G.729 encode/decode
+        # 6. G.729 encode/decode
         degraded_8k = g729_process(noisy_8k_lp)
 
-        # 6. Save pair
+        # 7. High-pass filter at 150 Hz (remove low-frequency rumble)
+        degraded_8k = apply_highpass(degraded_8k, cutoff_hz=120.0, fs=8000.0)
+
+        # 8. RMS normalisation to target ~0.025
+        degraded_8k = normalize_rms(degraded_8k, rng)
+
+        # 9. Save pair
         save_pair(file_id, clean_16k, degraded_8k, output_dir)
 
-        logger.info("Processed %s | SNR=%.1f dB | noise=%s", file_id, snr_db, os.path.basename(noise_path))
-        return {"id": file_id, "snr_db": round(snr_db, 3), "noise_file": noise_path}
+        logger.info("Processed %s | SNR=%.1f dB | noise=%s | reverb=%s",
+                    file_id, snr_db, os.path.basename(noise_path), reverb_applied)
+        return {
+            "id": file_id,
+            "snr_db": round(snr_db, 3),
+            "noise_file": noise_path,
+            "rir_file": rir_file_used,
+            "reverb_applied": reverb_applied,
+            "blend_ratio": blend if reverb_applied else "",
+        }
 
     except Exception as exc:  # noqa: BLE001
         logger.error("Failed to process %s: %s", clean_path, exc)
@@ -364,9 +475,26 @@ def main() -> None:
     )
     parser.add_argument("--clean_dir", required=True, help="Directory of clean 16 kHz WAV files.")
     parser.add_argument("--noise_dir", required=True, help="Directory of babble noise WAV files (e.g. MUSAN).")
+    parser.add_argument(
+        "--rir_dir",
+        default=None,
+        help="Directory of RIR WAV files for reverberation (e.g. musan/noise/reverb/). Optional.",
+    )
     parser.add_argument("--output_dir", default="data", help="Root output directory (default: data).")
     parser.add_argument("--snr_min", type=float, default=0.0, help="Minimum SNR in dB (default: 0).")
     parser.add_argument("--snr_max", type=float, default=20.0, help="Maximum SNR in dB (default: 20).")
+    parser.add_argument(
+        "--reverb_prob",
+        type=float,
+        default=0.6,
+        help="Probability of applying reverberation to a sample (default: 0.6).",
+    )
+    parser.add_argument(
+        "--blend_ratio",
+        type=float,
+        default=0.4,
+        help="Wet signal blend ratio for reverb (0=dry, 1=fully wet; default: 0.4).",
+    )
     parser.add_argument("--workers", type=int, default=4, help="Number of parallel workers (default: 4).")
     parser.add_argument("--seed", type=int, default=42, help="Global random seed (default: 42).")
     args = parser.parse_args()
@@ -386,6 +514,26 @@ def main() -> None:
         logger.error("No WAV files found in --noise_dir: %s", args.noise_dir)
         raise SystemExit(1)
 
+    # Gather optional RIR files
+    rir_files_str: list[str] = []
+
+    if args.rir_dir:
+        rir_list_path = Path(args.rir_dir)
+
+        if not rir_list_path.exists():
+            logger.error("RIR list file not found: %s", args.rir_dir)
+            raise SystemExit(1)
+
+        with open(rir_list_path, "r") as f:
+            rir_files_str = [line.strip() for line in f if line.strip()]
+
+        if not rir_files_str:
+            logger.warning("RIR list is empty. Reverb disabled.")
+        else:
+            logger.info("Loaded %d validated RIR files.", len(rir_files_str))
+    else:
+        logger.info("--rir_dir not provided. Reverberation will be skipped.")
+        
     noise_files_str = [str(p) for p in noise_files]
     logger.info("Found %d clean files and %d noise files.", len(clean_files), len(noise_files))
 
@@ -394,9 +542,12 @@ def main() -> None:
         (
             str(p),
             noise_files_str,
+            rir_files_str,
             args.output_dir,
             args.snr_min,
             args.snr_max,
+            args.reverb_prob,
+            args.blend_ratio,
             args.seed + idx,           # unique offset per sample
         )
         for idx, p in enumerate(clean_files)
@@ -413,7 +564,10 @@ def main() -> None:
     log_path = os.path.join(args.output_dir, "log.csv")
     os.makedirs(args.output_dir, exist_ok=True)
     with open(log_path, "w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=["id", "snr_db", "noise_file"])
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=["id", "snr_db", "noise_file", "rir_file", "reverb_applied", "blend_ratio"],
+        )
         writer.writeheader()
         writer.writerows(sorted(log_rows, key=lambda r: r["id"]))
 
