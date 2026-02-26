@@ -36,7 +36,7 @@ from pathlib import Path
 
 import numpy as np
 import soundfile as sf
-from scipy.signal import butter, sosfilt
+from scipy.signal import butter, sosfilt, resample_poly
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -52,16 +52,16 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _load_mono_16k(path: str) -> np.ndarray:
-    """Load a WAV file as a 16 kHz mono float32 array.
-
-    Raises ValueError if the file is not 16 kHz or not mono.
-    """
+    """Load WAV file and ensure output is 16 kHz mono float32."""
+    
     audio, sr = sf.read(path, dtype="float32", always_2d=False)
-    if sr != 16_000:
-        raise ValueError(f"Expected 16 kHz, got {sr} Hz: {path}")
+
     if audio.ndim > 1:
-        # Downmix to mono
         audio = audio.mean(axis=1)
+
+    if sr != 16_000:
+        audio = resample_poly(audio, up=16000, down=sr).astype(np.float32)
+
     return audio
 
 
@@ -335,8 +335,10 @@ def _process_one(args: tuple) -> dict | None:
         # 3. Resample 16 k → 8 k
         noisy_8k = resample_to_8k(noisy_16k)
 
-        # 4. Low-pass filter at 3.4 kHz
-        noisy_8k_lp = apply_lowpass(noisy_8k)
+        # 4. Mild low-pass filter at 3.1 kHz (HA-style bandwidth)
+        noisy_8k_lp = apply_lowpass(noisy_8k,cutoff_hz=3100.0, fs=8000.0,order=2)
+
+        # need to reverbation
 
         # 5. G.729 encode/decode
         degraded_8k = g729_process(noisy_8k_lp)
